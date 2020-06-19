@@ -1,0 +1,546 @@
+---
+title: "Progetto d'esame"
+author: "Luca Dorigo"
+date: "24 Giugno 2020"
+output: html_document
+runtime: shiny
+---
+```{r setup, include=FALSE, eval=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(igraph)
+library(ggraph)
+
+library(visNetwork)
+library(shinydashboard)
+library(ape)
+library(corrplot)
+```
+
+# StackOverflow Tag network
+In questo progetto andremo ad analizzare i tag usati dagli sviluppatori su StackOverflow nelle loro storie. 
+
+## Dataset
+
+```{r}
+nodes <- read.csv("stack_network_nodes.csv")
+nodes <- nodes %>%
+  select(-group) %>%
+  arrange(nodesize)
+
+head(nodes, 10)
+```
+
+I nodi rappresentano i tag usati dagli sviluppatori, in questo dataset sono contenuti solo quelli più frequenti (> 0.5% degli utenti e sono correlati con un altro nodo con un coefficiente di almeno 0.1).
+Elimino la colonna `group` perchè poi calcolerò i cluster indipendentemente.
+`nodes$nodesize` è proporzionale alla frequenza d'uso del tag.
+
+```{r}
+
+edges <- read.csv("stack_network_links.csv", stringsAsFactors = FALSE)
+edges <- edges %>%
+  filter(source <= target)
+
+head(edges, 10)
+```
+
+Trovo un arco tra due tag se questi vengono usati assieme nella stessa storia.
+`edges$value` è proporzionale all'indice di correlazione tra i due tag (cor * 100)
+
+### La rete
+
+Andiamo ora a creare e plottare il grafo
+
+```{r}
+# create graph
+g <- graph_from_data_frame(edges, directed = FALSE, nodes)
+
+normalize_size <- function(x) { 40 + 50 * x / max(x) }
+
+c <- components(g)
+
+V(g)$size <- normalize_size(nodes$nodesize)
+V(g)$color = factor(c$membership)
+```
+
+```{r, echo=FALSE}
+plot_graph <- function (x)
+{
+  visIgraph(x, randomSeed = 7, physics=TRUE) %>%
+    visPhysics(solver="barnesHut", barnesHut = list(gravitationalConstant = -10000, springLength = 200, springConstant = 0.001)) %>%
+    visInteraction(hover = T) %>%
+    visNodes(font = list(size = 0, color = "black")) %>%
+    visEdges(color = "black") %>%
+#    visOptions(highlightNearest = TRUE) %>%
+    visEvents(hoverNode = "function(e) { this.body.data.nodes.update({id: e.node, font: {size : 150}}); }") %>%
+    visEvents(blurNode = "function(e){ this.body.data.nodes.update({id: e.node, font: {size : 0}}); }")
+}
+
+plot_graph(g) %>% visOptions(highlightNearest = TRUE)
+```
+
+## Data Challenges
+
+Nel resto della presentazione studieremo i seguenti problemi:
+
+1. Quali sono i nodi più importanti, e come questa misura è correlata a `node$nodesize`
+2. Quali sono le tecnologie più versatili
+3. In quali categorie si possono dividere queste tecnologie
+
+
+## `nodesize` e centralità
+
+Primi 10 nodi per size, cioè le tecnologie più usate
+```{r}
+arrange(nodes, -nodesize) %>% head(10)
+
+```
+
+### Calcolo di misure di centralità e comparazione
+
+* Degree centrality
+```{r}
+V(g)$degree <- strength(g, weights = E(g)$value)
+
+```
+
+* Closeness
+```{r}
+# calcolo closeness solo sulla componente connessa più grande
+g1 <- induced_subgraph(g, V(g)[c$membership == 1])
+V(g)$closeness <- 0
+clo <- closeness(g1)
+g <- set_vertex_attr(g, "closeness", names(clo), clo)
+```
+
+* Betweenness
+```{r}
+V(g)$betweenness <- betweenness(g)
+```
+
+* Eigenvector centrality
+```{r}
+V(g)$eigen <- eigen_centrality(g)$vector
+```
+
+* Katz centrality
+```{r}
+A <- as_adjacency_matrix(g, attr="value", sparse=FALSE)
+eig <- eigen(A)$values
+r_katz <- max(abs(eig))
+V(g)$katz <- alpha_centrality(g, alpha = 0.85/r_katz)
+```
+
+* Page Rank
+```{r}
+D <- diag(V(g)$degree)
+eig <- eigen(solve(D) %*% A)$values
+r_pr <- max(abs(eig))
+V(g)$pageRank <- page_rank(g, damping=0.85/r_pr, personalized = rep(1, vcount(g)))$vector
+```
+
+```{r, echo=FALSE}
+E(g)$color = "black"
+
+cors = tibble(degree = cor(V(g)$degree, nodes$nodesize),
+              closeness = cor(V(g)$closeness, nodes$nodesize),
+              betweenness = cor(V(g)$betweenness, nodes$nodesize),
+              eigen = cor(V(g)$eigen, nodes$nodesize),
+              katz = cor(V(g)$katz, nodes$nodesize),
+              pageRank = cor(V(g)$pageRank, nodes$nodesize),
+              )
+
+fluidRow(
+  box(title = "Centrality measure:",
+      radioButtons("centrality",
+                   NULL,
+                   choices = list("degree" = 1,
+                                  "closeness" = 2,
+                                  "betweenness" = 3,
+                                  "eigenvector" = 4,
+                                  "Katz" = 5,
+                                  "Page Rank" = 6
+                   ))
+  ),
+  conditionalPanel(
+    condition="input.centrality == 5",
+    box(title="alpha:",
+        sliderInput("alpha", NULL, min=0, max=1/r_katz, value=0.85/r_katz)
+    )
+  ),
+  conditionalPanel(
+    condition="input.centrality == 6",
+    box(title="damping factor:",
+        sliderInput("damping", NULL, min=0, max=1/r_pr, value=0.85/r_pr)
+    )
+  )
+)
+fluidRow(
+  box(width=8,
+      renderVisNetwork({
+        V(g)$color <- 1
+        if (input$centrality == 1){
+          V(g)$size <- normalize_size(V(g)$degree)
+          sortedNodes <- tibble(name = nodes$name, size = V(g)$degree) %>% arrange(-size)
+        }
+        else if (input$centrality == 2) {
+          V(g)$size <- normalize_size(V(g)$closeness)
+          sortedNodes <- tibble(name = nodes$name, size = V(g)$closeness) %>% arrange(-size)
+        }
+        else if (input$centrality == 3) {
+          V(g)$size <- normalize_size(V(g)$betweenness)
+          sortedNodes <- tibble(name = nodes$name, size = V(g)$betweenness) %>% arrange(-size)
+        }
+        else if (input$centrality == 4) {
+          V(g)$size <- normalize_size(V(g)$eigen)
+          sortedNodes <- tibble(name = nodes$name, size = V(g)$eigen) %>% arrange(-size)
+        }
+        else if (input$centrality == 5) {
+          V(g)$size <- normalize_size(alpha_centrality(g, alpha=input$alpha))
+          sortedNodes <- tibble(name = nodes$name, size = alpha_centrality(g, alpha=input$alpha)) %>% arrange(-size)
+        }
+        else if (input$centrality == 6) {
+          V(g)$size <- normalize_size(page_rank(g, damping=input$damping, personalized=rep(1, vcount(g)))$vector)
+          sortedNodes <- tibble(name = nodes$name, size = page_rank(g, damping=input$damping, personalized=rep(1, vcount(g)))$vector) %>% arrange(-size)
+        }
+        V(g)[as.character(head(sortedNodes, 10)$name)]$color <- 2
+        plot_graph(g) %>% visOptions(highlightNearest = TRUE)
+      })
+  ),
+  box(width=4, title = "Most central nodes:",
+      renderTable({
+        if (input$centrality == 1)
+          tibble(name = nodes$name, degree = vertex_attr(g)$degree, nodesize=V(g)$nodesize) %>% arrange(-degree) %>% head(10)
+        else if (input$centrality == 2)
+          tibble(name = nodes$name, closeness = 1000 * vertex_attr(g)$closeness, nodesize=V(g)$nodesize) %>% arrange(-closeness) %>% head(10)
+        else if (input$centrality == 3)
+          tibble(name = nodes$name, betweenness = vertex_attr(g)$betweenness, nodesize=V(g)$nodesize) %>% arrange(-betweenness) %>% head(10)
+        else if (input$centrality == 4)
+          tibble(name = nodes$name, eigen_centrality = vertex_attr(g)$eigen, nodesize=V(g)$nodesize) %>% arrange(-eigen_centrality) %>% head(10)
+        else if (input$centrality == 5)
+        {
+          V(g)$katz <- alpha_centrality(g, alpha=input$alpha)
+          tibble(name = nodes$name, Katz = V(g)$katz, nodesize=V(g)$nodesize) %>% arrange(-Katz) %>% head(10)
+        }
+        else if (input$centrality == 6)
+        {
+          V(g)$pageRank <- page_rank(g, damping=input$damping, personalized = rep(1, vcount(g)))$vector
+          tibble(name = nodes$name, PageRank = V(g)$pageRank, nodesize=V(g)$nodesize) %>% arrange(-PageRank) %>% head(10)
+        }
+      })
+  )
+)
+fluidRow(
+  box(
+    renderPlot({
+      new_nodes <- as_data_frame(g, what="vertices")
+      plot <- ggplot(new_nodes, aes(x=nodesize))
+      (if (input$centrality == 1){
+        plot <- plot +
+          geom_point(aes(y=degree)) +
+          geom_smooth(method=lm, aes(y=degree), se=FALSE) +
+            labs(y = "Degree")
+      }
+        else if (input$centrality == 2){
+          plot <- plot +
+            geom_point(aes(y=closeness)) +
+            geom_smooth(method=lm, aes(y=closeness), se=FALSE) +
+            labs(y = "Closeness")
+        }
+        else if (input$centrality == 3){
+          plot <- plot + 
+            geom_point(aes(y=betweenness)) +
+            geom_smooth(method=lm, aes(y=betweenness), se=FALSE) +
+            labs(y = "Betweenness")
+        }
+        else if (input$centrality == 4){
+          plot <- plot + 
+            geom_point(aes(y=eigen)) +
+            geom_smooth(method=lm, aes(y=eigen), se=FALSE) +
+            labs(y = "Eigenvector Centrality")
+        }
+        else if (input$centrality == 5){
+          plot <- plot + 
+            geom_point(aes(y=alpha_centrality(g, alpha=input$alpha))) +
+            geom_smooth(method=lm, aes(y=alpha_centrality(g, alpha=input$alpha)), se=FALSE) +
+            labs(y = "Katz Centrality")
+        }
+        else if (input$centrality == 6){
+          plot <- plot +
+            geom_point(aes(y=page_rank(g, damping=input$damping, personalized = rep(1, vcount(g)))$vector)) +
+            geom_smooth(method=lm, aes(y=page_rank(g, damping=input$damping, personalized = rep(1, vcount(g)))$vector), se=FALSE) +
+            labs(y = "Page Rank")
+        }
+      )
+      plot <- plot + scale_x_log10() + scale_y_log10() + labs(x = "nodesize")
+      plot
+    })
+  ),
+  box
+  (
+    renderText({
+      if (input$centrality < 5)
+        value <- cors[[as.numeric(input$centrality)]]
+      else if (input$centrality == 5)
+        value <- cor(V(g)$nodesize, alpha_centrality(g, alpha=input$alpha))
+      else if (input$centrality == 6)
+        value <- cor(V(g)$nodesize, page_rank(g, damping=input$damping, personalized = rep(1, vcount(g)))$vector)
+      paste("Correlation: ", value)
+    })
+  )
+)
+
+```
+
+Come si può notare dagli scatterplot e dal valore della correlazione tra le varie misure di centralità e `nodesize`, molte delle tecnologie più importanti nella rete sono anche tra le più usate, ma non c'è una correlazione perfetta tra le due misure.
+
+## Tecnologie più versatili
+
+Una prima idea è considerare come tecnologia più versatile quella con più archi.
+
+```{r}
+fluidRow(
+  box(
+    renderTable({
+      tibble(name=V(g)$name, degree=degree(g)) %>% arrange(-degree) %>% head(10)
+    })
+  ),
+  box(
+    renderTable({
+      tibble(name=V(g)$name, weighted_degree=strength(g, weights = E(g)$value)) %>% arrange(-weighted_degree) %>% head(10)
+    })
+  )
+)
+```
+
+Una migliore stima delle tecnologie più versatili può essere ottenuta considerando i nodi più eterogenei, cioè quelli che hanno vicini diversi tra loro.
+
+### Similarità
+Innanzitutto calcoliamo la similarità per ogni coppia di nodi
+
+```{r}
+similarity = function(g, type = "cosine", mode = "col" ) {
+  A = as_adjacency_matrix(g, attr="value", sparse = FALSE)
+  if (mode == "row") {A = t(A)}
+  if (type == "cosine") {
+    euclidean = function(x) {sqrt(x %*% x)}
+    d = apply(A, 2, euclidean)
+    D = diag(1/d)
+    S = D %*% t(A) %*% A %*% D
+  }
+  if (type == "pearson") {
+    S = cor(A)
+  }
+  return(S)
+}
+
+S <- similarity(g, type="cosine")
+```
+
+```{r, echo=FALSE}
+sim_t <- tibble(
+    name1 = rep(V(g)$name, vcount(g)),
+    name2 = cbind(unlist(lapply(V(g)$name, function(x){rep(x, vcount(g))}), use.names=FALSE)),
+    sim = as.vector(S)) %>%
+  filter(name1 < name2) %>%
+  arrange(-sim) %>%
+  head(10)
+
+V(g)$size <- 70
+V(g)$color <- 1
+V(g)[sim_t$name1]$color <- 2
+V(g)[sim_t$name2]$color <- 2
+V(g)$similarity <- apply(S, 2, function(x) { paste(normalize_size(x), collapse=", ") })
+
+g1 <- g
+
+fluidRow(
+  box(width = 8,
+    renderVisNetwork({
+      plot_graph(g1) %>%
+        visOptions(highlightNearest = TRUE) %>%
+        visEvents(selectNode = "function(e){
+                  var node = this.body.data.nodes._data[e.nodes[0]];
+                  var strVals = node.similarity.split(', ')
+                  var ids = []
+                  this.body.data.nodes.forEach(el => ids.push({id: el.id, size: 20}));
+                  for (var i = 0; i < ids.length; i++) ids[i].size = parseInt(strVals[i])
+                  this.body.data.nodes.update(ids)
+        }")
+    })
+  ),
+  box(width = 4,
+    renderTable({ sim_t })
+  )
+)
+```
+
+### Eterogeneità
+Ora calcoliamo l'eterogeneità usando il complementare a 1 della similarità come misura di differenza
+
+```{r}
+shannon = function(p) {
+  x = p * log2(p)
+  x = replace(x, is.nan(x), 0)
+  return(-sum(x))
+}
+
+simpson = function(p) {
+  x = 1 - sum(p * p)
+  return(x)
+}
+
+rao = function(p, D) {
+  x = diag(p) %*% D %*% diag(p)
+  return(sum(c(x)))
+}
+
+heterogeneity = function(g, D, mode = "col") {
+  A = as_adjacency_matrix(g, attr = "value", sparse = FALSE)
+  if (mode == "col") {
+    A = A %*% diag(1/colSums(A))
+    dim = 2 
+  } else {
+    A = diag(1/rowSums(A)) %*% A
+    dim = 1 
+  }
+  return(list(shannon = apply(A, dim, shannon), 
+              simpson = apply(A, dim, simpson), 
+              rao = apply(A, dim, rao, D)))
+}
+
+
+D <- 1-S
+het <- heterogeneity(g, D)
+```
+
+```{r, echo=FALSE}
+fluidRow(
+  box(width=4,
+    renderTable({
+      tibble(name = V(g)$name, shannon=het$shannon) %>% arrange(-shannon) %>% head(10)
+    })
+  ),
+  box(width=4,
+    renderTable({
+      tibble(name = V(g)$name, simpson=het$simpson) %>% arrange(-simpson) %>% head(10)
+    })
+  ),
+  box(width=4,
+    renderTable({
+      tibble(name = V(g)$name, rao=het$rao) %>% arrange(-rao) %>% head(10)
+    })
+  )
+)
+
+```
+
+Notiamo che `hibernate` e `spring` non compaiono tra i nodi più eterogenei, questo perchè i loro vicini comuni sono nodi molto simili
+
+```{r, echo=FALSE}
+V(g)$size <- normalize_size(het$rao)
+V(g)$color <- 1
+V(g)[(tibble(name = V(g)$name, rao=het$rao) %>% arrange(-rao) %>% head(10))$name]$color <- 2
+
+plot_graph(g) %>% visOptions(highlightNearest = TRUE)
+```
+
+### Correlazione
+Confrontiamo le diverse misure di versatilità usate guardando la loro correlazione
+
+```{r}
+mat <- cbind(degree(g), strength(g, weights=E(g)$value), het$shannon, het$simpson, het$rao)
+colnames(mat) <- c("degree", "weighted_degree", "shannon", "simpson", "rao")
+
+corrplot(cor(mat), method="ellipse")
+```
+
+Notiamo che `degree` e `weighted_degree` sono molto simili, così come `shannon` e `simpson`, mentre `rao` si discosta dalle altre misure
+
+### Dendrogramma
+Usiamo la dissimilarità per costruire gerarchicamente un dendrogramma
+
+```{r, echo=FALSE}
+d <- as.dist(D)
+hc <- hclust(d, method = "average")
+phylo <- as.phylo(hc)
+phylo$tip.label[1:vcount(g)] <- V(g)$name
+plot(phylo, type="fan", label.offset=0.02, cex=0.6, no.margin=TRUE)
+```
+
+## Clustering
+
+```{r, warning=FALSE}
+clusters_list <- list(
+  fastGreedy = cluster_fast_greedy(g),
+  edgeBetweenness = cluster_edge_betweenness(g),
+  walktrap = cluster_walktrap(g),
+  labelProp = cluster_label_prop(g),
+  louvain = cluster_louvain(g)
+)
+
+modularities <- lapply(clusters_list, modularity) %>% unlist() %>% sort(decreasing=TRUE)
+modularities
+```
+
+Questo è un ottimo risultato per una procedura approssimata; infatti la modularità ottenuta con il clustering ottimale è circa `0.73`
+
+```{r}
+clusters <- clusters_list[[names(modularities[1])]]
+
+sizes(clusters)
+```
+
+```{r, echo=FALSE}
+V(g)$size <- 70
+V(g)$color <- membership(clusters)
+V(g)$clust <- membership(clusters)
+
+fluidRow(
+  box(width=9,
+    renderVisNetwork({
+      plot_graph(g) %>%
+        visEvents(selectNode = "function(e) {
+                    Shiny.setInputValue('selectedNode', e.nodes);
+                    var node = this.body.data.nodes._data[e.nodes[0]];
+                    var ids = []
+                    this.body.data.nodes.forEach(el => ids.push({id: el.id, group: el.group, clust: el.clust}))
+                    ids.forEach(function(el, index) {
+                      if (el.clust == node.clust)
+                        el.group = el.clust
+                      else
+                        el.color = 'rgba(200, 200, 200, 0.5)'
+                    })
+                    this.body.data.nodes.update(ids)
+                  }") %>%
+        visEvents(deselectNode = "function(e){
+                    Shiny.setInputValue('selectedNode', '')
+                    var ids = []
+                    this.body.data.nodes.forEach(el => ids.push({id: el.id, group: el.clust}))
+                    this.body.data.nodes.update(ids)
+                  }")
+    })
+  ),
+  box(width=3,
+    renderTable({
+      if (!is.null(input$selectedNode) && input$selectedNode != "")
+      {
+        nodeName <- strsplit(input$selectedNode, " -> ")[[1]][1]
+        cluster <- membership(clusters)[nodeName]
+        nodeNumber <- sum(membership(clusters)[membership(clusters) == cluster]) / cluster
+        tibble(
+          id = nodeNumber:1,
+          name = V(g)[membership(clusters) == cluster]$name
+        ) %>%
+          arrange(id)
+      }
+      else
+        head(tibble(id=1:1, name=1:1), 0)
+    })
+  )
+)
+```
